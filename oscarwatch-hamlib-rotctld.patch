@@ -1,0 +1,933 @@
+diff --git a/OscarWatch.Core/Hardware/DeviceIdentityNames.cs b/OscarWatch.Core/Hardware/DeviceIdentityNames.cs
+index 012d54d..646128c 100644
+--- a/OscarWatch.Core/Hardware/DeviceIdentityNames.cs
++++ b/OscarWatch.Core/Hardware/DeviceIdentityNames.cs
+@@ -45,6 +45,7 @@ public static class DeviceIdentityNames
+         RotatorType.UrcTcp => "URC rotator",
+         RotatorType.GreenHeronRt21 => "RT-21 rotator",
+         RotatorType.AntRunner => "AntRunner rotator",
++        RotatorType.HamlibRotctld => "Hamlib rotctld rotator",
+         _ => type.ToString()
+     };
+ }
+diff --git a/OscarWatch.Core/Models/RotatorSettings.cs b/OscarWatch.Core/Models/RotatorSettings.cs
+index cca32a8..99caefc 100644
+--- a/OscarWatch.Core/Models/RotatorSettings.cs
++++ b/OscarWatch.Core/Models/RotatorSettings.cs
+@@ -18,6 +18,8 @@ public sealed class RotatorSettings
+     public const int DefaultNetworkPort = 1111;
+     /// <summary>Default TCP port for <see cref="RotatorType.SpidMd01"/> Ethernet.</summary>
+     public const int DefaultSpidMd01NetworkPort = 23;
++    /// <summary>Default TCP port of a Hamlib <c>rotctld</c> daemon (<see cref="RotatorType.HamlibRotctld"/>).</summary>
++    public const int DefaultHamlibRotctldNetworkPort = 4533;
+ 
+     public bool Enabled { get; set; }
+     public RotatorType Type { get; set; } = RotatorType.YaesuGs232;
+@@ -26,6 +28,7 @@ public sealed class RotatorSettings
+     /// Serial vs raw TCP for GS-232 / EasyComm / SPID / SAEBRTrack.
+     /// Ignored when <see cref="Type"/> is <see cref="RotatorType.UrcTcp"/> (always TCP/JSON),
+     /// <see cref="RotatorType.SpidMd01"/> (always TCP Rot2Prog),
++    /// <see cref="RotatorType.HamlibRotctld"/> (always TCP to a rotctld daemon),
+     /// or <see cref="RotatorType.GreenHeronRt21"/> (always dual local serial).
+     /// </summary>
+     public RotatorTransportKind TransportKind { get; set; } = RotatorTransportKind.Serial;
+@@ -124,7 +127,7 @@ public sealed class RotatorSettings
+ 
+     /// <summary>True when this configuration uses TCP host/port instead of a serial COM port.</summary>
+     public bool UsesNetworkEndpoint =>
+-        Type is RotatorType.UrcTcp or RotatorType.SpidMd01
++        Type is RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.HamlibRotctld
+         || (Type != RotatorType.GreenHeronRt21 && TransportKind == RotatorTransportKind.Tcp);
+ 
+     /// <summary>
+@@ -132,7 +135,7 @@ public sealed class RotatorSettings
+     /// </summary>
+     public bool UsesSerialPort =>
+         Type == RotatorType.GreenHeronRt21
+-        || (Type is not (RotatorType.UrcTcp or RotatorType.SpidMd01)
++        || (Type is not (RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.HamlibRotctld)
+             && TransportKind == RotatorTransportKind.Serial);
+ 
+     /// <summary>True when the configured connection endpoint is present (serial port or host+port).</summary>
+diff --git a/OscarWatch.Core/Models/RotatorTransportKind.cs b/OscarWatch.Core/Models/RotatorTransportKind.cs
+index d687e0b..60bff1b 100644
+--- a/OscarWatch.Core/Models/RotatorTransportKind.cs
++++ b/OscarWatch.Core/Models/RotatorTransportKind.cs
+@@ -8,7 +8,8 @@ public enum RotatorTransportKind
+ 
+     /// <summary>
+     /// Raw TCP serial tunnel (e.g. ser2net).
+-    /// Ignored for <see cref="RotatorType.UrcTcp"/> and <see cref="RotatorType.SpidMd01"/>.
++    /// Ignored for <see cref="RotatorType.UrcTcp"/>, <see cref="RotatorType.SpidMd01"/>
++    /// and <see cref="RotatorType.HamlibRotctld"/>.
+     /// </summary>
+     Tcp = 1
+ }
+diff --git a/OscarWatch.Core/Models/RotatorType.cs b/OscarWatch.Core/Models/RotatorType.cs
+index 3724935..234bed1 100644
+--- a/OscarWatch.Core/Models/RotatorType.cs
++++ b/OscarWatch.Core/Models/RotatorType.cs
+@@ -20,5 +20,11 @@ public enum RotatorType
+     /// <summary>
+     /// MuseLab AntRunner: GRBL 1.1 on ESP32 over serial (115200). X azimuth, Y elevation, 360° = 40 mm.
+     /// </summary>
+-    AntRunner
++    AntRunner,
++    /// <summary>
++    /// Hamlib <c>rotctld</c> daemon over TCP (default port 4533). Any rotator supported by Hamlib
++    /// can be driven this way; OscarWatch only needs the <c>P</c> (set position), <c>p</c> (get
++    /// position) and <c>S</c> (stop) commands of the rotctld text protocol.
++    /// </summary>
++    HamlibRotctld
+ }
+diff --git a/OscarWatch.Tests/HamlibRotctldRotatorTests.cs b/OscarWatch.Tests/HamlibRotctldRotatorTests.cs
+new file mode 100644
+index 0000000..d84515b
+--- /dev/null
++++ b/OscarWatch.Tests/HamlibRotctldRotatorTests.cs
+@@ -0,0 +1,370 @@
++using OscarWatch.Core.Models;
++using OscarWatch.Rotator;
++
++namespace OscarWatch.Tests;
++
++public sealed class HamlibRotctldCodecTests
++{
++    [Theory]
++    [InlineData(90.0, 45.0, "P 90 45")]
++    [InlineData(123.456, 45.5, "P 123.46 45.5")]
++    [InlineData(0.0, 0.0, "P 0 0")]
++    [InlineData(-0.0, 10.0, "P 0 10")]
++    [InlineData(450.0, 180.0, "P 450 180")]
++    public void BuildSetPositionCommand_uses_invariant_decimal_notation(double az, double el, string expected)
++    {
++        Assert.Equal(expected, HamlibRotctldCodec.BuildSetPositionCommand(az, el));
++    }
++
++    [Theory]
++    [InlineData("RPRT 0", 0)]
++    [InlineData("RPRT -1", -1)]
++    [InlineData("RPRT -11", -11)]
++    [InlineData("  RPRT -4  ", -4)]
++    public void TryParseReport_reads_the_result_code(string line, int expectedCode)
++    {
++        Assert.True(HamlibRotctldCodec.TryParseReport(line, out var code));
++        Assert.Equal(expectedCode, code);
++    }
++
++    [Theory]
++    [InlineData(null)]
++    [InlineData("")]
++    [InlineData("   ")]
++    [InlineData("123.450000")]
++    [InlineData("RPRT")]
++    [InlineData("RPRT abc")]
++    public void TryParseReport_rejects_anything_that_is_not_a_report(string? line)
++    {
++        Assert.False(HamlibRotctldCodec.TryParseReport(line, out _));
++    }
++
++    [Theory]
++    [InlineData("123.450000", 123.45)]
++    [InlineData("  45  ", 45.0)]
++    [InlineData("-3.5", -3.5)]
++    [InlineData("360.000000\r", 360.0)]
++    public void TryParseAngle_reads_decimal_degrees(string line, double expected)
++    {
++        Assert.True(HamlibRotctldCodec.TryParseAngle(line, out var degrees));
++        Assert.Equal(expected, degrees, 6);
++    }
++
++    [Theory]
++    [InlineData(null)]
++    [InlineData("")]
++    [InlineData("abc")]
++    [InlineData("NaN")]
++    [InlineData("Infinity")]
++    [InlineData("RPRT -1")]
++    public void TryParseAngle_rejects_non_numeric_text(string? line)
++    {
++        Assert.False(HamlibRotctldCodec.TryParseAngle(line, out _));
++    }
++}
++
++public sealed class HamlibRotctldRotatorTests
++{
++    private static readonly RotatorSettings Limits360x90 = new()
++    {
++        AzimuthRange = RotatorAzimuthRange.Deg360,
++        ElevationRange = RotatorElevationRange.Deg90
++    };
++
++    [Fact]
++    public void SetPosition_sends_P_command_and_accepts_RPRT_0()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT 0");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        rotator.SetPosition(90, 45, new RotatorSettings());
++
++        Assert.Equal("P 90 45\n", transport.Written[0]);
++    }
++
++    [Fact]
++    public void SetPosition_clamps_to_the_configured_ranges()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT 0");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        rotator.SetPosition(400, 100, Limits360x90);
++
++        Assert.Equal("P 360 90\n", transport.Written[0]);
++    }
++
++    [Fact]
++    public void SetPosition_clamps_negative_values_to_zero()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT 0");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        rotator.SetPosition(-10, -5, Limits360x90);
++
++        Assert.Equal("P 0 0\n", transport.Written[0]);
++    }
++
++    [Fact]
++    public void SetPosition_throws_when_rotctld_reports_an_error()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT -1");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        var ex = Assert.Throws<InvalidOperationException>(
++            () => rotator.SetPosition(90, 45, new RotatorSettings()));
++        Assert.Contains("-1", ex.Message);
++    }
++
++    [Fact]
++    public void SetPosition_does_not_throw_when_rotctld_is_slow_to_answer()
++    {
++        var transport = new ScriptedRotctldTransport();
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        rotator.SetPosition(90, 45, new RotatorSettings());
++
++        Assert.Equal("P 90 45\n", transport.Written[0]);
++    }
++
++    [Fact]
++    public void GetPosition_reads_azimuth_and_elevation_lines()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("123.450000", "45.600000");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        var (azimuth, elevation) = rotator.GetPosition();
++
++        Assert.Equal("p\n", transport.Written[0]);
++        Assert.Equal(123, azimuth);
++        Assert.Equal(46, elevation);
++    }
++
++    [Fact]
++    public void GetPosition_keeps_azimuth_beyond_360_for_overlap_rotators()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("412.000000", "10.000000");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        var (azimuth, elevation) = rotator.GetPosition();
++
++        Assert.Equal(412, azimuth);
++        Assert.Equal(10, elevation);
++    }
++
++    [Fact]
++    public void GetPosition_returns_azimuth_only_when_elevation_line_is_missing()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("200.000000");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        var (azimuth, elevation) = rotator.GetPosition();
++
++        Assert.Equal(200, azimuth);
++        Assert.Null(elevation);
++    }
++
++    [Fact]
++    public void GetPosition_returns_nulls_on_timeout_and_on_garbage()
++    {
++        var transport = new ScriptedRotctldTransport();
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        Assert.Equal((null, null), rotator.GetPosition());
++
++        transport.EnqueueReply("not a number");
++        Assert.Equal((null, null), rotator.GetPosition());
++    }
++
++    [Fact]
++    public void GetPosition_stops_querying_after_the_backend_reports_it_cannot_read_position()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT -11");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        Assert.Equal((null, null), rotator.GetPosition());
++        var writesAfterFirstPoll = transport.Written.Count;
++
++        transport.EnqueueReply("100.000000", "20.000000");
++        Assert.Equal((null, null), rotator.GetPosition());
++        Assert.Equal(writesAfterFirstPoll, transport.Written.Count);
++    }
++
++    [Fact]
++    public void GetPosition_keeps_querying_after_a_transient_error()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT -5");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        Assert.Equal((null, null), rotator.GetPosition());
++
++        transport.EnqueueReply("100.000000", "20.000000");
++        var (azimuth, elevation) = rotator.GetPosition();
++        Assert.Equal(100, azimuth);
++        Assert.Equal(20, elevation);
++    }
++
++    [Fact]
++    public void Stop_sends_S_command()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT 0");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        rotator.Stop();
++
++        Assert.Equal("S\n", transport.Written[0]);
++    }
++
++    [Theory]
++    [InlineData("RPRT -4")]
++    [InlineData("RPRT -11")]
++    public void Stop_is_tolerated_when_the_backend_does_not_implement_it(string reply)
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply(reply);
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        rotator.Stop();
++
++        Assert.Equal("S\n", transport.Written[0]);
++    }
++
++    [Fact]
++    public void Stop_still_throws_on_other_errors()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT -6");
++        using var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        Assert.Throws<InvalidOperationException>(() => rotator.Stop());
++    }
++
++    [Fact]
++    public void Dispose_stops_the_rotator_and_closes_the_transport()
++    {
++        var transport = new ScriptedRotctldTransport();
++        transport.EnqueueReply("RPRT 0");
++        var rotator = new HamlibRotctldRotator(transport);
++        rotator.Open();
++
++        rotator.Dispose();
++
++        Assert.Equal(["S\n"], transport.Written);
++        Assert.False(transport.IsOpen);
++    }
++
++    [Fact]
++    public void Factory_creates_the_rotctld_driver_for_the_hamlib_type()
++    {
++        using var driver = RotatorDriverFactory.Create(new RotatorSettings
++        {
++            Type = RotatorType.HamlibRotctld,
++            NetworkHost = "127.0.0.1",
++            NetworkPort = RotatorSettings.DefaultHamlibRotctldNetworkPort
++        });
++
++        Assert.IsType<HamlibRotctldRotator>(driver);
++    }
++
++    [Fact]
++    public void Settings_treat_hamlib_rotctld_as_a_network_endpoint_even_with_serial_transport()
++    {
++        var settings = new RotatorSettings
++        {
++            Type = RotatorType.HamlibRotctld,
++            TransportKind = RotatorTransportKind.Serial,
++            NetworkHost = "127.0.0.1",
++            NetworkPort = RotatorSettings.DefaultHamlibRotctldNetworkPort,
++            Port = "COM3"
++        };
++
++        Assert.True(settings.UsesNetworkEndpoint);
++        Assert.False(settings.UsesSerialPort);
++        Assert.True(settings.HasConfiguredEndpoint);
++        Assert.Empty(settings.GetConfiguredSerialPorts());
++    }
++
++    [Fact]
++    public void Settings_require_a_host_for_hamlib_rotctld()
++    {
++        var settings = new RotatorSettings
++        {
++            Type = RotatorType.HamlibRotctld,
++            NetworkHost = "",
++            NetworkPort = RotatorSettings.DefaultHamlibRotctldNetworkPort
++        };
++
++        Assert.False(settings.HasConfiguredEndpoint);
++        settings.NetworkHost = "shack-pc";
++        Assert.True(settings.HasConfiguredEndpoint);
++    }
++
++    [Fact]
++    public void Default_port_is_4533()
++    {
++        Assert.Equal(4533, RotatorSettings.DefaultHamlibRotctldNetworkPort);
++    }
++}
++
++/// <summary>Line-oriented transport that replays queued replies and records everything written.</summary>
++internal sealed class ScriptedRotctldTransport : IRotatorSerialTransport
++{
++    private readonly Queue<string> _replies = new();
++
++    public List<string> Written { get; } = [];
++    public bool IsOpen { get; private set; }
++    public bool DtrEnable { get; set; }
++    public bool RtsEnable { get; set; }
++
++    public void EnqueueReply(params string[] lines)
++    {
++        foreach (var line in lines)
++            _replies.Enqueue(line);
++    }
++
++    public void Open() => IsOpen = true;
++
++    public void Write(string text) => Written.Add(text);
++
++    public void Write(byte[] buffer, int offset, int count) =>
++        Written.Add(System.Text.Encoding.ASCII.GetString(buffer, offset, count));
++
++    public void DiscardInBuffer()
++    {
++    }
++
++    public void DiscardOutBuffer()
++    {
++    }
++
++    public string ReadLine() => _replies.Count > 0 ? _replies.Dequeue() : throw new TimeoutException();
++
++    public string ReadExisting() => "";
++
++    public int Read(byte[] buffer, int offset, int count) => 0;
++
++    public void Dispose() => IsOpen = false;
++}
+diff --git a/OscarWatch/Resources/Strings.es.resx b/OscarWatch/Resources/Strings.es.resx
+index 1ba4f07..518533d 100644
+--- a/OscarWatch/Resources/Strings.es.resx
++++ b/OscarWatch/Resources/Strings.es.resx
+@@ -3273,6 +3273,9 @@
+   <data name="Settings.Rotator.TypeNote.Saebrt">
+     <value>Interfaces clásicas de seguimiento por satélite.</value>
+   </data>
++  <data name="Settings.Rotator.TypeNote.Hamlib">
++    <value>Cualquier rotor compatible con Hamlib, mediante un demonio rotctld en ejecución, puerto predeterminado 4533.</value>
++  </data>
+   <data name="Settings.Rotator.TypeNote.Urc">
+     <value>Ultimate Rotator Controller por Ethernet. Póngalo en modo remoto (REM).</value>
+   </data>
+@@ -3315,6 +3318,9 @@
+   <data name="Settings.Rotator.NetworkNote">
+     <value>OscarWatch se conecta como cliente TCP. En el URC, active el servidor de sockets y el modo de seguimiento remoto (REM) para que GOTO mueva las antenas. El puerto predeterminado es 1111.</value>
+   </data>
++  <data name="Settings.Rotator.NetworkNoteHamlib">
++    <value>OscarWatch se conecta como cliente TCP a un demonio rotctld de Hamlib, que ya debe estar en ejecución (por ejemplo: rotctld -m &lt;modelo&gt; -r COM5 -s 9600; los modelos se listan con rotctl -l). Use localhost si el demonio está en este PC. El puerto TCP predeterminado es 4533. OscarWatch no inicia rotctld por usted.</value>
++  </data>
+   <data name="Settings.Rotator.NetworkNoteTcpSerial">
+     <value>OscarWatch se conecta como cliente TCP a un túnel serie en bruto (por ejemplo ser2net). Configure la velocidad y las opciones serie en el servidor. Mejor en red local: una latencia alta puede provocar tiempos de espera.</value>
+   </data>
+diff --git a/OscarWatch/Resources/Strings.resx b/OscarWatch/Resources/Strings.resx
+index 4c7076d..955e94d 100644
+--- a/OscarWatch/Resources/Strings.resx
++++ b/OscarWatch/Resources/Strings.resx
+@@ -3276,6 +3276,9 @@ Continue?</value>
+   <data name="Settings.Rotator.TypeNote.Urc">
+     <value>Ultimate Rotator Controller over Ethernet. Set it to remote (REM) mode.</value>
+   </data>
++  <data name="Settings.Rotator.TypeNote.Hamlib">
++    <value>Any rotator supported by Hamlib, through a running rotctld daemon, default port 4533.</value>
++  </data>
+   <data name="Settings.Rotator.TypeNote.GreenHeron">
+     <value>Two COM ports, one per axis.</value>
+   </data>
+@@ -3315,6 +3318,9 @@ Continue?</value>
+   <data name="Settings.Rotator.NetworkNote">
+     <value>OscarWatch connects as a TCP client. On the URC, enable the socket server and select remote (REM) tracking mode so GOTO commands move the antennas. Default port is 1111.</value>
+   </data>
++  <data name="Settings.Rotator.NetworkNoteHamlib">
++    <value>OscarWatch connects as a TCP client to a Hamlib rotctld daemon, which must already be running (for example: rotctld -m &lt;model&gt; -r COM5 -s 9600; list models with rotctl -l). Use localhost for a daemon on this PC. Default TCP port is 4533. OscarWatch does not start rotctld for you.</value>
++  </data>
+   <data name="Settings.Rotator.NetworkNoteTcpSerial">
+     <value>OscarWatch connects as a TCP client to a raw serial tunnel (for example ser2net). Configure baud rate and serial options on the server. Best used on a local network — high latency can cause timeouts.</value>
+   </data>
+diff --git a/OscarWatch/Rotator/HamlibRotctldCodec.cs b/OscarWatch/Rotator/HamlibRotctldCodec.cs
+new file mode 100644
+index 0000000..523d532
+--- /dev/null
++++ b/OscarWatch/Rotator/HamlibRotctldCodec.cs
+@@ -0,0 +1,61 @@
++using System.Globalization;
++
++namespace OscarWatch.Rotator;
++
++/// <summary>
++/// Hamlib <c>rotctld</c> text protocol (default, non-extended mode), newline terminated.
++/// <list type="bullet">
++/// <item><c>P az el</c> sets the position and is answered with <c>RPRT n</c> (<c>n</c> = 0 on success).</item>
++/// <item><c>p</c> reads the position and is answered with two lines: azimuth, then elevation.</item>
++/// <item><c>S</c> stops the rotator and is answered with <c>RPRT n</c>.</item>
++/// </list>
++/// A failed command of any kind is answered with a negative <c>RPRT</c> code instead of data.
++/// See https://hamlib.github.io/ (rotctld man page).
++/// </summary>
++public static class HamlibRotctldCodec
++{
++    /// <summary>Hamlib <c>RIG_ENIMPL</c>: the backend does not implement the command.</summary>
++    public const int ErrorNotImplemented = -4;
++
++    /// <summary>Hamlib <c>RIG_ENAVAIL</c>: the command is not available on this device.</summary>
++    public const int ErrorNotAvailable = -11;
++
++    public const string GetPositionCommand = "p";
++    public const string StopCommand = "S";
++
++    public static string BuildSetPositionCommand(double azimuthDeg, double elevationDeg) =>
++        $"P {FormatAngle(azimuthDeg)} {FormatAngle(elevationDeg)}";
++
++    /// <summary>True when <paramref name="line"/> is a <c>RPRT n</c> report; <paramref name="code"/> receives <c>n</c>.</summary>
++    public static bool TryParseReport(string? line, out int code)
++    {
++        code = 0;
++        if (string.IsNullOrWhiteSpace(line))
++            return false;
++
++        var text = line.Trim();
++        if (!text.StartsWith("RPRT", StringComparison.OrdinalIgnoreCase))
++            return false;
++
++        return int.TryParse(text.AsSpan(4).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out code);
++    }
++
++    /// <summary>Parses one angle line of a <c>p</c> reply (for example <c>123.450000</c>).</summary>
++    public static bool TryParseAngle(string? line, out double degrees)
++    {
++        degrees = 0;
++        if (string.IsNullOrWhiteSpace(line))
++            return false;
++
++        return double.TryParse(line.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out degrees)
++            && !double.IsNaN(degrees)
++            && !double.IsInfinity(degrees);
++    }
++
++    private static string FormatAngle(double degrees)
++    {
++        // Avoid "-0" for negative zero; rotctld accepts plain decimal notation.
++        var value = degrees == 0 ? 0.0 : degrees;
++        return value.ToString("0.##", CultureInfo.InvariantCulture);
++    }
++}
+diff --git a/OscarWatch/Rotator/HamlibRotctldRotator.cs b/OscarWatch/Rotator/HamlibRotctldRotator.cs
+new file mode 100644
+index 0000000..c5ecc9e
+--- /dev/null
++++ b/OscarWatch/Rotator/HamlibRotctldRotator.cs
+@@ -0,0 +1,160 @@
++using OscarWatch.Core.Models;
++using Serilog;
++
++namespace OscarWatch.Rotator;
++
++/// <summary>
++/// Drives any Hamlib-supported rotator through a <c>rotctld</c> daemon over TCP.
++/// Start the daemon first, for example <c>rotctld -m &lt;model&gt; -r COM5 -s 9600</c> (<c>rotctl -l</c> lists models), then point
++/// OscarWatch at its host and port (default 4533). See <see cref="HamlibRotctldCodec"/> for the wire format.
++/// </summary>
++public sealed class HamlibRotctldRotator : IRotatorDriver
++{
++    private const int ReplyTimeoutMs = 2000;
++
++    private static readonly ILogger Log = Serilog.Log.ForContext<HamlibRotctldRotator>();
++
++    private readonly IRotatorSerialTransport _port;
++    private readonly SemaphoreSlim _gate = new(1, 1);
++
++    /// <summary>
++    /// Set when rotctld reports that the backend cannot read its position (Hamlib <c>RIG_ENIMPL</c> /
++    /// <c>RIG_ENAVAIL</c>), so later polls skip the query instead of failing every second.
++    /// </summary>
++    private bool _positionUnsupported;
++
++    public HamlibRotctldRotator(string host, int port)
++        : this(new TcpRotatorTransport(host, port, ReplyTimeoutMs, ReplyTimeoutMs, "\n"))
++    {
++    }
++
++    internal HamlibRotctldRotator(IRotatorSerialTransport transport)
++    {
++        _port = transport;
++    }
++
++    public void Open() => _port.Open();
++
++    public void SetPosition(double azimuthDeg, double elevationDeg, RotatorSettings settings)
++    {
++        var az = Math.Clamp(azimuthDeg, 0, settings.MaxAzimuthDeg);
++        var el = Math.Clamp(elevationDeg, 0, settings.MaxElevationDeg);
++        SendCommand(HamlibRotctldCodec.BuildSetPositionCommand(az, el), tolerateUnsupported: false);
++    }
++
++    public void Stop() => SendCommand(HamlibRotctldCodec.StopCommand, tolerateUnsupported: true);
++
++    public (int? Azimuth, int? Elevation) GetPosition()
++    {
++        _gate.Wait();
++        try
++        {
++            if (_positionUnsupported)
++                return (null, null);
++
++            _port.DiscardInBuffer();
++            _port.Write(HamlibRotctldCodec.GetPositionCommand + "\n");
++
++            string first;
++            try
++            {
++                first = _port.ReadLine().Trim();
++            }
++            catch (TimeoutException)
++            {
++                return (null, null);
++            }
++
++            if (HamlibRotctldCodec.TryParseReport(first, out var code))
++            {
++                if (code is HamlibRotctldCodec.ErrorNotImplemented or HamlibRotctldCodec.ErrorNotAvailable)
++                {
++                    _positionUnsupported = true;
++                    Log.Information("rotctld backend cannot report its position (RPRT {Code}); position feedback disabled", code);
++                }
++
++                return (null, null);
++            }
++
++            if (!HamlibRotctldCodec.TryParseAngle(first, out var azimuthDeg))
++                return (null, null);
++
++            int? azimuth = (int)Math.Round(azimuthDeg);
++
++            string second;
++            try
++            {
++                second = _port.ReadLine().Trim();
++            }
++            catch (TimeoutException)
++            {
++                return (azimuth, null);
++            }
++
++            int? elevation = HamlibRotctldCodec.TryParseAngle(second, out var elevationDeg)
++                ? (int)Math.Round(elevationDeg)
++                : null;
++            return (azimuth, elevation);
++        }
++        finally
++        {
++            _gate.Release();
++        }
++    }
++
++    public void Dispose()
++    {
++        try
++        {
++            if (_port.IsOpen)
++            {
++                try { Stop(); } catch { /* ignore */ }
++            }
++        }
++        catch
++        {
++            // ignore dispose errors
++        }
++
++        _port.Dispose();
++        _gate.Dispose();
++    }
++
++    private void SendCommand(string command, bool tolerateUnsupported)
++    {
++        _gate.Wait();
++        try
++        {
++            _port.DiscardInBuffer();
++            _port.Write(command + "\n");
++
++            string reply;
++            try
++            {
++                reply = _port.ReadLine();
++            }
++            catch (TimeoutException)
++            {
++                // Best effort: some backends answer late. The next command discards any stale reply.
++                Log.Debug("rotctld did not answer '{Command}' within {Timeout} ms", command, ReplyTimeoutMs);
++                return;
++            }
++
++            if (!HamlibRotctldCodec.TryParseReport(reply, out var code) || code == 0)
++                return;
++
++            if (tolerateUnsupported
++                && (code is HamlibRotctldCodec.ErrorNotImplemented or HamlibRotctldCodec.ErrorNotAvailable))
++            {
++                Log.Debug("rotctld does not support '{Command}' (RPRT {Code})", command, code);
++                return;
++            }
++
++            throw new InvalidOperationException($"rotctld rejected '{command}' (RPRT {code}).");
++        }
++        finally
++        {
++            _gate.Release();
++        }
++    }
++}
+diff --git a/OscarWatch/Rotator/RotatorDriverFactory.cs b/OscarWatch/Rotator/RotatorDriverFactory.cs
+index 2a12f8c..a73faae 100644
+--- a/OscarWatch/Rotator/RotatorDriverFactory.cs
++++ b/OscarWatch/Rotator/RotatorDriverFactory.cs
+@@ -21,9 +21,22 @@ public static class RotatorDriverFactory
+                 CreateTransport(settings, settings.Port, 1000, 1000, ";"),
+                 CreateTransport(settings, settings.ElevationPort, 1000, 1000, ";")),
+             RotatorType.AntRunner => new GrblRotator(CreateTransport(settings, 500, 500, "\n")),
++            RotatorType.HamlibRotctld => CreateHamlibRotctld(settings),
+             _ => new Gs232Rotator(CreateTransport(settings, 1000, 1000, "\r"), settings.IsAzimuthOnly)
+         };
+ 
++    private static HamlibRotctldRotator CreateHamlibRotctld(RotatorSettings settings)
++    {
++        var host = string.IsNullOrWhiteSpace(settings.NetworkHost)
++            ? RotatorSettings.DefaultNetworkHost
++            : settings.NetworkHost.Trim();
++        var port = settings.NetworkPort > 0
++            ? settings.NetworkPort
++            : RotatorSettings.DefaultHamlibRotctldNetworkPort;
++        var transport = new TracingRotatorTransport(new TcpRotatorTransport(host, port, 2000, 2000, "\n"), $"{host}:{port}");
++        return new HamlibRotctldRotator(transport);
++    }
++
+     private static SpidRotator CreateSpidMd01(RotatorSettings settings)
+     {
+         var host = string.IsNullOrWhiteSpace(settings.NetworkHost)
+diff --git a/OscarWatch/ViewModels/SettingsViewModel.cs b/OscarWatch/ViewModels/SettingsViewModel.cs
+index 48bd5ca..746ad4c 100644
+--- a/OscarWatch/ViewModels/SettingsViewModel.cs
++++ b/OscarWatch/ViewModels/SettingsViewModel.cs
+@@ -330,6 +330,7 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+         RotatorType.UrcTcp => _l.Get("Settings.Rotator.TypeNote.Urc"),
+         RotatorType.GreenHeronRt21 => _l.Get("Settings.Rotator.TypeNote.GreenHeron"),
+         RotatorType.AntRunner => _l.Get("Settings.Rotator.TypeNote.AntRunner"),
++        RotatorType.HamlibRotctld => _l.Get("Settings.Rotator.TypeNote.Hamlib"),
+         _ => _l.Get("Settings.Rotator.TypeNote.Gs232")
+     };
+ 
+@@ -343,7 +344,7 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+ 
+     public bool ShowRotatorTransportFields =>
+         SelectedRotatorTypeChoice?.Value is not (
+-            RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.GreenHeronRt21);
++            RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.HamlibRotctld or RotatorType.GreenHeronRt21);
+ 
+     public bool ShowRotatorSerialFields =>
+         ShowRotatorTransportFields
+@@ -353,7 +354,7 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+         SelectedRotatorTypeChoice?.Value == RotatorType.GreenHeronRt21;
+ 
+     public bool ShowRotatorNetworkFields =>
+-        SelectedRotatorTypeChoice?.Value is RotatorType.UrcTcp or RotatorType.SpidMd01
++        SelectedRotatorTypeChoice?.Value is RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.HamlibRotctld
+         || (ShowRotatorTransportFields
+             && SelectedRotatorTransportChoice?.Value == RotatorTransportKind.Tcp);
+ 
+@@ -363,6 +364,9 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+     public bool ShowRotatorSpidMd01NetworkNote =>
+         SelectedRotatorTypeChoice?.Value == RotatorType.SpidMd01;
+ 
++    public bool ShowRotatorHamlibNetworkNote =>
++        SelectedRotatorTypeChoice?.Value == RotatorType.HamlibRotctld;
++
+     public bool ShowRotatorTcpSerialNetworkNote =>
+         ShowRotatorTransportFields
+         && SelectedRotatorTransportChoice?.Value == RotatorTransportKind.Tcp;
+@@ -1015,6 +1019,7 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+             new(RotatorType.EasyComm, "EasyComm"),
+             new(RotatorType.Saebrt, "SAEBRTrack"),
+             new(RotatorType.UrcTcp, "OZ9AAR URC (TCP)"),
++            new(RotatorType.HamlibRotctld, "Hamlib rotctld (TCP)"),
+             new(RotatorType.GreenHeronRt21, "Green Heron RT-21 Az-El"),
+             new(RotatorType.AntRunner, "AntRunner (GRBL)")
+         ];
+@@ -1375,7 +1380,7 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+             Enabled = RotatorEnabled,
+             Type = SelectedRotatorTypeChoice?.Value ?? RotatorType.YaesuGs232,
+             TransportKind = SelectedRotatorTypeChoice?.Value is
+-                RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.GreenHeronRt21
++                RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.HamlibRotctld or RotatorType.GreenHeronRt21
+                 ? RotatorTransportKind.Serial
+                 : SelectedRotatorTransportChoice?.Value ?? RotatorTransportKind.Serial,
+             Port = SelectedComPort ?? "",
+@@ -2385,7 +2390,7 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+             Enabled = RotatorEnabled,
+             Type = SelectedRotatorTypeChoice?.Value ?? RotatorType.YaesuGs232,
+             TransportKind = SelectedRotatorTypeChoice?.Value is
+-                RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.GreenHeronRt21
++                RotatorType.UrcTcp or RotatorType.SpidMd01 or RotatorType.HamlibRotctld or RotatorType.GreenHeronRt21
+                 ? RotatorTransportKind.Serial
+                 : SelectedRotatorTransportChoice?.Value ?? RotatorTransportKind.Serial,
+             Port = SelectedComPort ?? "",
+@@ -2428,14 +2433,25 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+         }
+         else if (value.Value == RotatorType.SpidMd01)
+         {
+-            if (RotatorNetworkPort == RotatorSettings.DefaultNetworkPort || RotatorNetworkPort <= 0)
++            if (RotatorNetworkPort == RotatorSettings.DefaultNetworkPort
++                || RotatorNetworkPort == RotatorSettings.DefaultHamlibRotctldNetworkPort
++                || RotatorNetworkPort <= 0)
+                 RotatorNetworkPort = RotatorSettings.DefaultSpidMd01NetworkPort;
+         }
+         else if (value.Value == RotatorType.UrcTcp)
+         {
+-            if (RotatorNetworkPort == RotatorSettings.DefaultSpidMd01NetworkPort || RotatorNetworkPort <= 0)
++            if (RotatorNetworkPort == RotatorSettings.DefaultSpidMd01NetworkPort
++                || RotatorNetworkPort == RotatorSettings.DefaultHamlibRotctldNetworkPort
++                || RotatorNetworkPort <= 0)
+                 RotatorNetworkPort = RotatorSettings.DefaultNetworkPort;
+         }
++        else if (value.Value == RotatorType.HamlibRotctld)
++        {
++            if (RotatorNetworkPort == RotatorSettings.DefaultNetworkPort
++                || RotatorNetworkPort == RotatorSettings.DefaultSpidMd01NetworkPort
++                || RotatorNetworkPort <= 0)
++                RotatorNetworkPort = RotatorSettings.DefaultHamlibRotctldNetworkPort;
++        }
+ 
+         RefreshComPortConflictIfReady();
+     }
+@@ -2455,6 +2471,7 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+         OnPropertyChanged(nameof(ShowRotatorNetworkFields));
+         OnPropertyChanged(nameof(ShowRotatorUrcNetworkNote));
+         OnPropertyChanged(nameof(ShowRotatorSpidMd01NetworkNote));
++        OnPropertyChanged(nameof(ShowRotatorHamlibNetworkNote));
+         OnPropertyChanged(nameof(ShowRotatorTcpSerialNetworkNote));
+         OnPropertyChanged(nameof(RotatorTypeNote));
+         NotifyRotatorAzimuthOnlyVisibility();
+@@ -2475,9 +2492,12 @@ public partial class SettingsViewModel : ViewModelBase, IDisposable
+         if (port is > 0 and <= 65535)
+             return port;
+ 
+-        return type == RotatorType.SpidMd01
+-            ? RotatorSettings.DefaultSpidMd01NetworkPort
+-            : RotatorSettings.DefaultNetworkPort;
++        return type switch
++        {
++            RotatorType.SpidMd01 => RotatorSettings.DefaultSpidMd01NetworkPort,
++            RotatorType.HamlibRotctld => RotatorSettings.DefaultHamlibRotctldNetworkPort,
++            _ => RotatorSettings.DefaultNetworkPort
++        };
+     }
+ 
+     partial void OnSelectedAzimuthRangeChoiceChanged(RotatorAzimuthOption? value)
+diff --git a/OscarWatch/Views/SettingsWindow.axaml b/OscarWatch/Views/SettingsWindow.axaml
+index 53920e9..4c1f1bb 100644
+--- a/OscarWatch/Views/SettingsWindow.axaml
++++ b/OscarWatch/Views/SettingsWindow.axaml
+@@ -1303,6 +1303,11 @@
+                          TextWrapping="Wrap"
+                          IsVisible="{Binding ShowRotatorSpidMd01NetworkNote}"
+                          Text="{loc:Localize Key=Settings.Rotator.NetworkNoteSpidMd01}" />
++              <TextBlock Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
++                         FontSize="11"
++                         TextWrapping="Wrap"
++                         IsVisible="{Binding ShowRotatorHamlibNetworkNote}"
++                         Text="{loc:Localize Key=Settings.Rotator.NetworkNoteHamlib}" />
+               <TextBlock Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                          FontSize="11"
+                          TextWrapping="Wrap"
+diff --git a/README.md b/README.md
+index 26c77e1..9a15a83 100644
+--- a/README.md
++++ b/README.md
+@@ -152,6 +152,7 @@ Pull requests for more native rig support are welcome. A HamLib backend is not o
+ | **EasyComm**     | EasyComm II | M2 and other EasyComm-compatible controllers (SPID also works in **EC** mode if you prefer) |
+ | **SAEBRTrack**   | SAEBRTrack  | PSR-100, Arduino sketches, and similar fire-and-forget interfaces; 9600 baud; no position feedback |
+ | **OZ9AAR URC**   | TCP/JSON    | Ultimate Rotator Controller: host/port (default **1111**); set URC to **REM** mode |
++| **Hamlib rotctld** | TCP (rotctld text protocol) | Any Hamlib-supported rotator through a running `rotctld` daemon: host/port (default **4533**), e.g. `rotctld -m <model> -r COM5 -s 9600` (`rotctl -l` lists models) |
+ | **Green Heron RT-21 Az-El** | DCU-1 (dual serial) | Two USB COM ports (azimuth + elevation), 4800 baud; choose this type, not GS-232 ([help](https://oscarwatch.org/docs/rotators)) |
+ 
+ GS-232, SPID, EasyComm, and SAEBRTrack can also use **TCP serial** (e.g. ser2net) instead of a local COM port: choose **Connection → TCP serial** under Settings → Rotator.
+@@ -174,7 +175,7 @@ Open **Settings** from the menu. Tabs:
+ | **Appearance** | UI language (restart required); local or UTC times; light / dark / system theme; 12- or 24-hour clock; map options (footprint arrows, greyline, next-orbit ground track, map centre); check for application updates on startup                                                                                                                                       |
+ | **Voice**      | Enable announcements, trigger elevation (default −3°), voice selection, test button; optional **scheduled pass** alert (ding + window before AOS)                                                                                                                                                            |
+ | **Recording**  | Automatic pass recording (WAV or MP3 via ffmpeg), input device, start/stop elevation, output folder, test clip                                                                                                                                                       |
+-| **Rotator**    | Type (GS-232 / SPID / SPID MD-01 TCP / EasyComm / SAEBRTrack / OZ9AAR URC TCP / Green Heron RT-21), Serial or TCP serial connection (COM or host/port), 360°/450° azimuth, smart 450°, **0–90° / 0–180° elevation**, optional keyhole avoidance (0–180° only), park, track-start elevation, calibration offsets |
++| **Rotator**    | Type (GS-232 / SPID / SPID MD-01 TCP / EasyComm / SAEBRTrack / OZ9AAR URC TCP / Hamlib rotctld TCP / Green Heron RT-21), Serial or TCP serial connection (COM or host/port), 360°/450° azimuth, smart 450°, **0–90° / 0–180° elevation**, optional keyhole avoidance (0–180° only), park, track-start elevation, calibration offsets |
+ | **Radio**      | Rig type, COM port, **Dual radio** (FT-817/818, FT-857, FT-991(A), IC-705, IC-7300, IC-905, IC-7100, IC-706 series, TH-D74/D75, TS-990S/TS-890S/TS-590S/TS-590SG over COM or LAN, SDR rigctl downlink, Dummy uplink RX-only, or mixed; separate downlink/uplink), region, per-leg CI-V address for ICOM dual legs, linear CW receive mode (USB/LSB vs CW on both VFOs), Doppler CAT thresholds (FM default 350 Hz, SSB/CW default 50 Hz; adaptive and lead on by default), resume CAT after dial / uplink wait after dial (see [help](https://oscarwatch.org/docs/radio-doppler-tuning#passband-knob)), pause CAT |
+ | **Integrations** | **GPS** (NMEA serial or gpsd — see [help](https://oscarwatch.org/docs/settings#gps)); **hams.at** roves; **OscarWatch** status reporting (API token); **Cloudlog** (URL, API key, logbook, Radio API); **QRZ** and **HamQTH** callbook lookup for Logbook; **Satellite link** WebSocket for third-party loggers ([help](https://oscarwatch.org/docs/satellite-link)) |
+ 
+diff --git a/documents/building-rotator-drivers.md b/documents/building-rotator-drivers.md
+index f77560e..6567072 100644
+--- a/documents/building-rotator-drivers.md
++++ b/documents/building-rotator-drivers.md
+@@ -53,6 +53,7 @@ Reference implementations:
+ | SPID Rot1Prog / Rot2Prog | 13-byte binary packets (stop/status/set); no reply to set on classic hardware | [`SpidRotator.cs`](../OscarWatch/Rotator/SpidRotator.cs) |
+ | SPID MD-01 / MD-02 (TCP) | Same Rot2Prog binary over TCP (default port 23); set-position returns a 12-byte status | [`SpidRotator.cs`](../OscarWatch/Rotator/SpidRotator.cs) via `RotatorType.SpidMd01` |
+ | OZ9AAR URC (TCP) | JSON `{"POLL"}` / `{"GOTO":[az,el]}` over TCP (default port 1111) | [`UrcTcpRotator.cs`](../OscarWatch/Rotator/UrcTcpRotator.cs) |
++| Hamlib `rotctld` (TCP) | Text protocol over TCP (default port 4533): `P az el` → `RPRT n`, `p` → two lines (az, el), `S` → `RPRT n`. Reuses `TcpRotatorTransport`; backends that cannot read position (`RPRT -4` / `-11`) stop being polled | [`HamlibRotctldRotator.cs`](../OscarWatch/Rotator/HamlibRotctldRotator.cs), codec in [`HamlibRotctldCodec.cs`](../OscarWatch/Rotator/HamlibRotctldCodec.cs) |
+ | Green Heron RT-21 Az-El | DCU-1 per axis on **two** COM ports (`AP1xxx.y\r;`, `BI1;`, stop `;`) | [`GreenHeronRt21Rotator.cs`](../OscarWatch/Rotator/GreenHeronRt21Rotator.cs) |
+ | AntRunner (GRBL 1.1) | Absolute jog `$J=G90 G21 F50 X.. Y..` in mm (360° = 40 mm, X az, Y el), status `?` → `<Idle\|MPos:x,y,z\|...>`, stop is jog cancel `0x85`. Reads `$$` on open but never writes settings. Handles north wrap itself (360° rotator, machine X spans one extra turn either way). | [`GrblRotator.cs`](../OscarWatch/Rotator/GrblRotator.cs) |
+ 
